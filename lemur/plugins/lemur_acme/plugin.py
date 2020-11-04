@@ -20,7 +20,7 @@ import dns.resolver
 import josepy as jose
 from acme import challenges, errors, messages
 from acme.client import BackwardsCompatibleClientV2, ClientNetwork
-from acme.errors import PollError, TimeoutError, WildcardUnsupportedError
+from acme.errors import PollError, TimeoutError, WildcardUnsupportedError, Error
 from acme.messages import Error as AcmeError
 from botocore.exceptions import ClientError
 from flask import current_app
@@ -779,3 +779,61 @@ class ACMEIssuerPlugin(IssuerPlugin):
     def cancel_ordered_certificate(self, pending_cert, **kwargs):
         # Needed to override issuer function.
         pass
+
+    def revoke_certificate(self, certificate, comments):
+        current_app.logger.debug(f"""Revoking certificate {type(certificate)} with auth: {certificate.authority}, comments: {comments}""")
+        # current_app.logger.debug(f"""Certificate body: {certificate.body}""")
+        self.acme = AcmeHandler()
+        acme_client, registration = self.acme.setup_acme_client(certificate.authority)
+        order_info = authorization_service.get(certificate.external_id)
+        if certificate.dns_provider_id:
+            dns_provider = dns_provider_service.get(certificate.dns_provider_id)
+
+            for domain in order_info.domains:
+                # Currently, we only support specifying one DNS provider per certificate, even if that
+                # certificate has multiple SANs that may belong to different providers.
+                self.acme.dns_providers_for_domain[domain] = [dns_provider]
+        else:
+            for domain in order_info.domains:
+                self.acme.autodetect_dns_providers(domain)
+        
+        try:
+            order = acme_client.new_order(certificate.csr)
+        except WildcardUnsupportedError:
+            metrics.send("get_ordered_certificate_wildcard_unsupported", "counter", 1)
+            raise Exception(
+                "The currently selected ACME CA endpoint does"
+                " not support issuing wildcard certificates."
+            )
+        try:
+            authorizations = self.acme.get_authorizations(
+                acme_client, order, order_info
+            )
+        except ClientError:
+            sentry.captureException()
+            metrics.send("get_ordered_certificate_error", "counter", 1)
+            current_app.logger.error(
+                f"Unable to resolve pending cert: {certificate.name}", exc_info=True
+            )
+            return False
+
+        authorizations = self.acme.finalize_authorizations(acme_client, authorizations)
+
+        def from_string(key_pem, is_x509_cert=True):
+            if is_x509_cert:
+              pubkey = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, key_pem)
+            else:
+              pubkey = OpenSSL.crypto.load_privatekey(OpenSSL.crypto.FILETYPE_PEM, key_pem)
+            return jose.ComparableX509(pubkey)
+
+        cert = from_string(certificate.body)
+        current_app.logger.debug(f"""Certificate body import: {type(cert)}""")
+
+        current_app.logger.debug(f"""acme client: {type(acme_client)}""")
+
+        try:
+            acme_client.revoke(cert,comments)
+            metrics.send("acme_revoke_certificate_success", "counter", 1)
+            certificate.status = "revoked"
+        except Error as e:
+            current_app.logger.error(f"""This certificate is already revoked before!""")
